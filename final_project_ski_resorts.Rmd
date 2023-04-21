@@ -1,0 +1,701 @@
+---
+title: 'STAT 847: Final Project'
+subtitle: 'Making Data-Driven Decisions When Planning Your Next Ski Trip'
+author: 'Jacky Chen, j57chen@uwaterloo.ca'
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    keep_tex: yes
+    number_sections: no
+---
+
+Deadline April 23rd. Your deliverable will be an RMD file and a PDF emailed to me at [mj2davis\@uwaterloo.ca](mailto:mj2davis@uwaterloo.ca){.email} Total word count target is 1000 words.
+
+Find a dataset we didn't cover in class (I recommend the SSC case study competition, or the latest on Kaggle datasets under EDA)
+
+It has to be large enough with enough features to fill at least 6 of 8 tasks. (Notice that 4 are mandatory, 4 are optional)
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(skimr)
+library(lubridate)
+library(sp)
+library(GGally)
+library(rworldmap)
+library(rpart)
+library(caret)
+library(ggplot2)
+library(rpart.plot)
+library(leaflet)
+library(sf)
+```
+\newpage
+#### 1) Describe and justify two different topics or approaches you might want to consider for this dataset and task. You don't have to use these tasks in the actual analysis. (Mandatory)
+
+The data I choose for the final project is world-wide ski resort data (ticket price, location, number of lifts, etc) and amount of snow fall data. The dataset is publicly avaiable on [Kaggle](https://www.kaggle.com/datasets/ulrikthygepedersen/ski-resorts?select=resorts.csv)
+
+Two tasks I can think of are:
+
+##### 1.1) Find the optimal ski trip destination at a certain time of a year
+
+Skiing is a popular winter activity enjoyed by millions of people around the world. However, planning a ski trip can be expensive, especially if someone does not have enough amount of information about ski resorts. With this dataset, we can provide data-driven insights to help skiers/snowboarders plan their trips more efficiently and cost-effectively. 
+
+This task would require building an evaluation function to rank ski resorts based on key factors of a ski trip. The factors may include accumulative amount of snowfall since the start of the season, forecast of fresh snow, area of accessible terrain (depending on skier/snowboarder skill level), resort ticket price, travel expense, ski school price (optional), etc. This would be a very useful tool for ski/snowboard enthusiasts.
+
+##### 1.2) Ski resort price analysis and prediction
+
+Ski resort pricing can be highly variable and complex, with factors such as location, area and maintenance costs. By analyzing pricing data, we can identify patterns and trends that help us understand the drivers of these price fluctuations and make better decisions about when and where to book our ski trips. We can analyze the key factors that affect ticket price by building a regression model about price.
+
+\newpage
+#### 2) Describe and show the code used to clean and collect the data. (Optional)
+
+##### 2.1) Read CSV
+
+We firstly read CSV files into dataframes
+
+```{r}
+resorts_raw <- read.csv("resorts.csv")
+snow_raw <- read.csv("snow.csv")
+```
+
+##### 2.2) Clean snow dataset
+
+Take a look at snow dataset. As shown below, the amount of snow in this Kaggle dataset seems to be normalized to be in the range of [0, 100].
+
+```{r}
+snow_df = snow_raw
+snow_df$Month = as_date(snow_df$Month)
+summary(snow_df)
+```
+
+Map coordinates in snow dataset to continent & country. This will be needed in Q5.2.
+
+```{r}
+# Ref: https://stackoverflow.com/questions/21708488/get-country-and-continent-from-longitude-and-latitude-point-in-r
+
+# The single argument to this function, points, is a data.frame in which:
+#   - column 1 contains the longitude in degrees
+#   - column 2 contains the latitude in degrees
+coords2continent = function(points)
+{  
+  # countriesSP <- getMap(resolution='low')
+  countriesSP <- getMap(resolution='high') #you could use high res map from rworldxtra if you were concerned about detail
+
+  # converting points to a SpatialPoints object
+  # setting CRS directly to that from rworldmap
+  pointsSP = SpatialPoints(points, proj4string=CRS(proj4string(countriesSP)))  
+
+  # use 'over' to get indices of the Polygons object containing each point 
+  indices = over(pointsSP, countriesSP)
+
+  #indices$continent   # returns the continent (6 continent model)
+  # indices$REGION   # returns the continent (7 continent model)
+  return (list("continent" = indices$REGION, "country" = indices$ADMIN))
+}
+
+temp = coords2continent(snow_raw[, c("Longitude", "Latitude")])
+
+snow_df[, "continent"] = temp$continent
+snow_df[, "country"] = temp$country
+
+summary(snow_df)
+```
+
+Some snow report cannot be matched to a continent or country. We will leave it for now.
+
+##### 2.3) Clean resort dataset
+
+Now we take a look at resort dataset
+
+```{r}
+summary(resorts_raw)
+```
+
+Based on the summary above, we notice some resorts have $0 price. I will inspect these outliers below.
+
+```{r}
+resorts_raw |> filter(Price <= 0) |> arrange(Continent) |> select(Resort, Country, Continent, Price)
+```
+
+For this study, I am especially interested in Canadian ski resorts. I could manually fix the outliers but I would not spend much effort to do so if they are not about Canadian ski resorts. None of the outliers is Canadian resort so I will drop them.
+
+```{r}
+resorts_df = resorts_raw
+resorts_df = resorts_df[resorts_df$Price > 0, ] 
+```
+
+Season column in *resorts.csv* is descriptive, such as "April", "December - April", "November - May, June - August", "Year-round", and "Unknown". This is not useful at all for our analysis. We are going to parse the number of months open from season strings in the this section.
+
+We firstly define a function to parse season strings. I will try to make it as general as possible so that it can be reused when data is updated.
+
+```{r}
+parse_season = function(season_str){
+  num_months_open = 0
+  binary_encoder = rep(0:0, each=12) # 0/1 indicating if resort is open in each month
+  season_str = str_replace_all(season_str, " ", "")
+  if(tolower(season_str) == "year-round"){
+    binary_encoder = rep(1:1, each=12)
+  }
+  else if (tolower(season_str) == "unknown"){
+    binary_encoder = rep(0:0, each=12)
+  }
+  else if (!str_detect(season_str, "-")){
+    # open single month
+    month = match(season_str, month.name) # convert month name to number
+    binary_encoder = replace(binary_encoder, month, 1)
+  }
+  else{
+    parts = strsplit(season_str, ",")
+    for (part in parts[[1]]){
+      tokens = str_split_fixed(part, "-", 2)
+  
+      # convert month name to number
+      start = match(tokens[1,1], month.name)
+      end = match(tokens[1,2], month.name)
+      # print(cat(start,"-",end))
+      
+      if (end < start) {
+        end = end + 12
+      }
+      months = seq(start, end, by=1) %% 12 |> unique()
+      months = replace(months, which(months == 0), 12) # change month 0 to month 12
+      binary_encoder = replace(binary_encoder, months, 1)
+    }
+  }
+  num_months_open = sum(binary_encoder)
+  return(list("season_length" = num_months_open, "months_open"=binary_encoder))
+}
+```
+
+Now we apply parse_season function to the Season column of the resorts dataframe.
+
+```{r}
+month_names = month(seq(1,12, by=1), label=TRUE, abbr=FALSE) |> as.character()
+for (i in 1:nrow(resorts_df)){
+  results = parse_season(resorts_df[i,c("Season")])
+  resorts_df[i,c("season_length")] = results$season_length
+  resorts_df[i,month_names] = results$months_open # binary encoder for 12 months
+}
+```
+
+We need to check if our parsing function works as expected. The result below looks fine.
+
+```{r}
+resorts_df |> select(Season, season_length) |> unique() |> arrange(season_length)
+```
+
+The resort dataframe has the latitudes of the highest and lowest points. We will use them to calculate resort vertical elevation (i.e. highest point - lowest point).
+
+```{r}
+resorts_df$height = resorts_df$Highest.point - resorts_df$Lowest.point
+```
+
+##### 2.4) Join snow and resort datasets
+
+I want to know average amount of snow fall for each resort. To do this, we will need to join resort dataframe and snow dataframe together using longitude and latitude. However, the precision of data in two dataframes are different, making it none join results. To solve this problem, I will round the longitude and latitude.
+
+Round longitude and latitude and merge dataframes.
+
+```{r}
+# round lat and long in resort dataset
+resorts_df$Lat_rounded = round(resorts_df$Latitude, digits=1)
+resorts_df$Long_rounded = round(resorts_df$Longitude, digits=1)
+
+# round lat and long in snow dataset
+snow_df$Lat_rounded = round(snow_raw$Latitude, digits=1)
+snow_df$Long_rounded = round(snow_raw$Longitude, digits=1)
+
+mean_snow_df = snow_df |> group_by(Lat_rounded, Long_rounded) |> summarise(mean_snow=mean(Snow))
+
+resorts_df |> 
+  left_join (
+    mean_snow_df,
+    by=c('Lat_rounded'='Lat_rounded', 'Long_rounded'='Long_rounded')
+  ) |> 
+  filter(is.na(mean_snow)) |> 
+  count()
+```
+
+408 resorts cannot be matched with snow fall data if we round to 1 decimal digit. We will try rounding longitude and latitude to integers.
+
+```{r}
+# round lat and long in resort dataset
+resorts_df$Lat_rounded = round(resorts_df$Latitude, digits=0)
+resorts_df$Long_rounded = round(resorts_df$Longitude, digits=0)
+
+# round lat and long in snow dataset
+snow_df$Lat_rounded = round(snow_raw$Latitude, digits=0)
+snow_df$Long_rounded = round(snow_raw$Longitude, digits=0)
+
+mean_snow_df = snow_df |> group_by(Lat_rounded, Long_rounded) |> summarise(mean_snow=mean(Snow), sd_snow=sd(Snow))
+
+resorts_df |> 
+  left_join (
+    mean_snow_df,
+    by=c('Lat_rounded'='Lat_rounded', 'Long_rounded'='Long_rounded')
+  ) |> 
+  filter(is.na(mean_snow)) |> 
+  count()
+```
+
+Now there are only 2 resorts do not have snow fall data.
+
+Certainly, we would like our data as accurate as possible. We will accept rounding to integers because off by 1 latitude/longitude corresponds to off by 111 km, which is acceptable for snow fall estimation.
+
+Now I will create a monthly snow report for every ski resort. I use snow dataset to left join the resort dataset and filter the rows that have a match. Then I group the dataframe by resort and month to calculate monthly snowfall for each resort.
+
+```{r}
+snow_resort_df = snow_df |> 
+  left_join (
+    resorts_df,
+    by=c('Lat_rounded'='Lat_rounded', 'Long_rounded'='Long_rounded')
+  ) |>
+  filter(!is.na(Resort)) |> 
+  group_by(Month, Resort) |> 
+  summarise(monthly_snow=mean(Snow)) |> 
+  left_join (
+    resorts_df,
+    by=c('Resort'='Resort')
+  )
+```
+
+Add a column to indicate if the ski resort is open in current month and 2 columns to indicate the end of the month and snow amount (for creating graphs).
+
+```{r}
+snow_resort_df = cbind(snow_resort_df, is_open_curr_month=NA)
+snow_resort_df = cbind(snow_resort_df, Month_end=NA)
+snow_resort_df = cbind(snow_resort_df, month_end_snow=NA)
+
+current_resort = ""
+
+# order df by resort then by month
+snow_resort_df = snow_resort_df[order(snow_resort_df[,"Resort"], snow_resort_df[,"Month"]), ]
+
+for (i in 1:nrow(snow_resort_df)){
+  # find if resort is open in that month
+  month_name = month(snow_resort_df[i,]$Month, label = TRUE, abbr = FALSE)
+  is_open = "Yes"
+  if (snow_resort_df[i, c(month_name)] == 0){
+    is_open = "No"
+  }
+  snow_resort_df[i,]$is_open_curr_month = is_open
+  
+  # if resort is changed, reset variables
+  if (snow_resort_df[i,"Resort"] != current_resort){
+    # reset variables
+    current_resort = snow_resort_df[i,"Resort"]
+  }
+  
+  # if next row is not out of bound and it's about the same ski resort, use next month's snow as the snow of current month end
+  if (i+1 <= nrow(snow_resort_df) & snow_resort_df[i+1,"Resort"] == current_resort){ 
+    snow_resort_df[i,]$Month_end = snow_resort_df[i+1,]$Month
+    snow_resort_df[i,]$month_end_snow = snow_resort_df[i+1,]$monthly_snow
+  }
+  # if next row is not out of bound but it's about a new resort, we reached the end of current resort
+  # use this month's snow as the snow of current month end
+  else if (i+1 <= nrow(snow_resort_df) & snow_resort_df[i+1,"Resort"] != current_resort){ 
+    snow_resort_df[i,]$Month_end = ceiling_date(ymd(snow_resort_df[i,]$Month), 'month') - days(1) # end of month
+    snow_resort_df[i,]$month_end_snow = snow_resort_df[i,]$monthly_snow
+  }
+  # we reached the last row of df
+  else if (i+1 > nrow(snow_resort_df)){
+    snow_resort_df[i,]$Month_end = ceiling_date(ymd(snow_resort_df[i,]$Month), 'month') - days(1) # end of month
+    snow_resort_df[i,]$month_end_snow = snow_resort_df[i,]$monthly_snow
+  }
+}
+```
+
+Make sure everything looks fine with joined dataframe
+
+```{r}
+summary(snow_resort_df)
+```
+
+```{r}
+annual_snow_resort_df = snow_resort_df |>
+  filter(is_open_curr_month == "Yes") |>
+  group_by(Resort) |>
+  summarise(annual_mean_snow=mean(monthly_snow), annual_total_snow=sum(monthly_snow)) |>
+  left_join (
+    resorts_df,
+    by=c('Resort'='Resort')
+  )
+```
+
+```{r}
+summary(annual_snow_resort_df)
+```
+
+
+\newpage
+#### 3) Give a ggpairs plot of what you think are the six most important variables. At least one must be categorical, and one continuous. Explain your choice of variables and the trends between them. (Mandatory)
+
+I want to know what are the factors that correlates with price. My initial assumption is seasonality, snow condition and location are the main factors. 
+
+I also want to know what are the factors that determine if a ski resort wants to build terrain parks in Q4, so `Snowparks` is also included in this ggpairs plot.
+
+```{r}
+ggpairs(annual_snow_resort_df, 
+              columns = c("Price", "Difficult.slopes", "season_length", "annual_total_snow", "Continent", "Snowparks"), 
+              progress = FALSE)
+```
+
+##### 3.1) Price vs Continent
+
+In our dataset, Europe has the most number of ski resorts, followed by North America and Asia.
+
+North America has the widest spread of price, followed by Europe. Asia and South America price are the most centralized.
+
+North American resorts are significantly more expensive than resorts in other continents. Almost 50% of North America resorts are more expensive than the top-end (expensive) ski resorts in Europe, Asia, and South America.
+
+I select two most expensive ski resorts from each continent. Now I start to question if the price I payed was worth it 🧐, because the price of, say Lake Louise, is more expensive than the most expensive resort in Asian and Sounth America, and it's almost the same price of the most luxurious resort in Europe.
+
+```{r}
+df_list = split(annual_snow_resort_df, annual_snow_resort_df$Continent)
+df_top = lapply(df_list, function(x) head(x[order(x$Price, decreasing = TRUE), ], 2))
+df_final = do.call(rbind, df_top) |> select(Resort, Continent, Country, Price) |> arrange(Price)
+df_final 
+```
+
+##### 3.2) Price vs other variables
+
+There is a correlation between price and number of difficult slopes. For the majority of ski resorts, the number of difficult slopes is below 10.
+
+Surprisingly, there is no correlation between price and season length or annual total snow.
+
+Whether a ski resort has terrain park or not does not affect the price.
+
+\newpage
+#### 4) Build a classification tree of one of the six variables from the last part as a function of the other five, and any other explanatory variables you think are necessary. Show code, explain reasoning, and show the tree as a simple (ugly) plot. Show the confusion matrix. Give two example predictions and follow them down the tree. (Mandatory)
+
+I am curious what are the factors that decide if a ski resort is willing to build a terrain park. My assumption is the difficulty of the ski resort, season length, and the amount of snow might be the main factors. I will pass those 3 attributes and other attributes to build a tree model and see what attributes will be used by the mode.
+
+Feature engineering and train test split:
+
+```{r}
+# convert string features to factors
+model_data_df = annual_snow_resort_df
+model_data_df$Continent = factor(model_data_df$Continent)
+model_data_df$Snowparks = factor(model_data_df$Snowparks)
+
+# make this example reproducible
+set.seed(1)
+
+# Train test split
+sample = sample(c(TRUE, FALSE), nrow(model_data_df), replace=TRUE, prob=c(0.8,0.2))
+train_df = model_data_df[sample, ]
+test_df = model_data_df[!sample, ]
+```
+
+##### 4.1) Build classification tree
+
+Build a classification tree and evaluate its performance
+
+```{r}
+# build a classification tree
+tree_model = rpart(Snowparks ~ Price + Difficult.slopes + season_length + annual_total_snow + Continent + season_length, data=train_df, method = "class")
+# make prediction
+pred = predict(tree_model, test_df, type="class")
+# evaluate
+confusionMatrix(pred, test_df$Snowparks, mode = "everything", positive="Yes")
+```
+
+Print a table of optimal prunings based on a complexity parameter (CP).
+
+```{r}
+printcp(tree_model)
+```
+
+In the original classification tree, accuracy is 0.7701 and F1 is 0.8667. 4 variables are used in the tree: 
+
+- annual_total_snow 
+- Continent
+- Difficult.slopes
+- Price
+
+The CP was 0.01 at the end, and 0.017 when there was six branches left to grow. I will try pruning technique by setting cp \> 0.017 to see if we can prevent overfitting.
+
+```{r}
+# train pruned model
+tree_model_pruned = prune(tree_model, cp=0.02)
+# make prediction
+pred = predict(tree_model_pruned, test_df, type="class")
+# evaluate
+confusionMatrix(pred, test_df$Snowparks, mode = "everything", positive="Yes")
+```
+
+```{r}
+printcp(tree_model_pruned)
+```
+
+The pruned model improves F1 score from 0.8667 to 0.89032, and accuracy from 0.7701 to 0.8046. In addition, only 2 variables (annual_total_snow and Difficult.slopes) are used to construct the tree model, which simplifies model interpretability. Therefore, we will choose the pruned tree as our final model.
+
+##### 4.2) Visualize the classification tree
+
+Visualize the pruned tree:
+
+```{r, fig.width=8, fig.height=6}
+rpart.plot(tree_model_pruned, uniform=TRUE)
+```
+
+##### 4.3) Follow example predictions down the tree
+
+Below are five examples and I will follow their prediction down the tree.
+
+```{r}
+test_samples = test_df |> filter(Country == "Canada" | Resort == "Furano") |> arrange(Difficult.slopes) |> select(Resort, Price, Difficult.slopes, season_length,annual_total_snow, Continent, season_length, Snowparks)
+test_samples
+```
+
+```{r}
+predict(tree_model_pruned, test_samples, type="class")
+```
+
+Furano ski resort in Japan only has 2 difficult slopes so we go down the left branch of the root node. Its annual total snow is 442, which is greater than 408 so we go down the right branch of the 2-level node. Now we reach the leaf node of Yes category.
+
+Panorama, Fernie, Lake Louise, and Red Mountain ski resorts in Canada have at least 20 difficult slopes so we go down the right branch of the root node. Now we reach the leaf node of Yes category.
+
+\newpage
+#### 5) Build a visually impressive ggplot to show the relationship between at least three variables. (Optional)
+
+##### 5.1) Build a ggplot to show relationship between Canadian ski resorts, month and snow fall.
+
+Since BC has most of the ski resorts in Canada, I will split Canadian dataset into BC and other provinces
+
+```{r}
+snow_canada_df = snow_resort_df |> filter(Country == "Canada")
+snow_canada_BC_df = snow_canada_df |> filter(Resort %in% c("Whistler","Sun Peaks", "Silver Star", "Revelstoke Mountain Resort", "Red Mountain Resort-Rossland", "Panorama", "Mount Washington", "Kimberley", "Kicking Horse - Golden", "Fernie", "Cypress Mountain", "Big White", "Apex Resort"))
+snow_canada_Other_df = snow_canada_df |> filter(Resort %in% c("Sunshine Village","Marmot Basin-Jasper","Lake Louise","Castle Mountain", "Mont-Sainte-Anne-Beaupre?","Mont Tremblant","Le Massif"))
+```
+
+```{r, fig.width=10, fig.height=6}
+ggplot() +
+  geom_segment(data = snow_canada_BC_df, 
+               aes(x = Month, y = monthly_snow, xend = Month_end, yend = month_end_snow, colour=Resort, linetype = as.character(is_open_curr_month))) +
+  scale_linetype_manual(name = "Resort is open", values=c("dotted", "solid")) +
+  xlab("Month") +
+  ylab("Monthly Snowfall") +
+  ggtitle("Monthly Snow Report for Ski Resorts - BC, Canada")
+```
+
+As shown in the plot, Whistler has the longest season among all Canadian resorts. It is the only place to go if you want to ski in early spring and summer. Kicking Horse in Golden, BC consistently has the most amount of snowfall when it is open. For most of the time, Cypress Mountain should be avoided for people who are looking for fresh snow. Even though Silver Star and Red Mountain also seem to be not having too much snow in early of the year, I think this is because March snow fall data is missing for those areas (they have descent amount of snow in Jan and Feb).
+
+```{r, fig.width=10, fig.height=6}
+ggplot() +
+  geom_segment(data = snow_canada_Other_df, 
+               aes(x = Month, y = monthly_snow, xend = Month_end, yend = month_end_snow, colour=Resort, linetype = as.character(is_open_curr_month))) +
+  scale_linetype_manual(name = "Resort is open", values=c("dotted", "solid")) +
+  xlab("Month") +
+  ylab("Monthly Snowfall") +
+  ggtitle("Monthly Snow Report for Ski Resorts - Canada without BC")
+```
+
+Sunshine Village, Lake Louise, and Castle Mountain are very close to each other so their lines overlap. Le Massif and Mont Sainte Anne also overlap.
+
+Alberta ski resorts generally have more snow than Quebec ski resorts. From January to March are the best months for Mont Tremblant, but it has the least amount of snow in other months.
+
+##### 5.2) Build an interactive map to visualiza North America ski resorts and snowfall data
+
+I will build a map in the following section to visualize ski resorts and snow fall data. This is especially helpful for ski enthusiastics to determine where to go for their next trip.
+
+I chose Leaflet as the map engine for its interactivity, customizability and rich community supports (such as terrain base map). References are listed here:
+
+-   [tutorial](https://rstudio.github.io/leaflet/)
+-   [base map providers](http://leaflet-extras.github.io/leaflet-providers/preview/index.html)
+
+```{r}
+suppressMessages(library(tidyverse))
+```
+
+Create spatial dataframe
+
+```{r}
+resort_spatial_df = st_as_sf(
+  annual_snow_resort_df,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326
+)
+
+snow_spatial_df = snow_df |> group_by(Latitude, Longitude, continent, country) |> summarise(mean_snow=mean(Snow)) |> st_as_sf(
+  coords = c("Longitude", "Latitude"),
+  crs = 4326
+)
+
+snow_spatial_df$mean_snow = round(snow_spatial_df$mean_snow, digits = 0)
+```
+
+Create cusomized color palettes
+
+```{r}
+custom_snow_palette <- colorBin("BuGn", snow_spatial_df$mean_snow, bins = 5)
+custom_price_palette <- colorBin("YlOrRd", resort_spatial_df$Price, bins = 3)
+```
+
+Create dataframes for North America data
+
+```{r}
+north_america.snow_spatial_df = snow_spatial_df |> filter(continent == "North America")
+north_america.resort_spatial_df = resort_spatial_df |> filter(Continent == "North America")
+```
+
+The code below shows ski resorts and average snow fall in North America
+
+```{r}
+basemap = leaflet() %>% 
+          addProviderTiles(providers$Esri.WorldTerrain) |> # Stamen.Terrain
+          setView(lng = -98, lat = 44, zoom = 4)
+basemap  %>% 
+  addCircleMarkers(data = north_america.snow_spatial_df,
+                   color = custom_snow_palette(north_america.snow_spatial_df$mean_snow),
+                   fillOpacity = 0.5,
+                  opacity = 0.5,
+                    stroke = FALSE,
+                   radius = 5) %>%
+  
+            addCircleMarkers(data = north_america.resort_spatial_df,
+                   color = custom_price_palette(north_america.resort_spatial_df$Price),
+                   fillOpacity = 0.5,
+                  opacity = 0.8,
+                  stroke = TRUE,
+                  popup = ~as.character(paste(north_america.resort_spatial_df$Resort, " ($", north_america.resort_spatial_df$Price, ")", sep = "")),
+                   radius = 3) |>
+  
+          addLegend(pal = custom_snow_palette,
+                title = "Mean Snowfall",
+                values = north_america.snow_spatial_df$mean_snow) |>
+  
+          addLegend(pal = custom_price_palette,
+                title = "Ski Resort Price",
+                values = north_america.resort_spatial_df$Price)
+```
+
+This **interactive** map shows snowfall and ski resorts in North America. You can zoom in/out, drag, click on a ski resort to see its name and price, etc., so it is better to view it in HTML than in PDF.
+
+I choose only to show North America data because showing world-wide data in Leaflet makes R Markdown lag. There are too many data points rendering in Leaflet at the same time regardless of zoom level. I think replacing snow fall data points with raster data or base map could improve this issue, but I couldn't find a raster data nor a base map layer representing snow fall. Therefore, using dots is the best visualization I can do.
+
+\newpage
+#### 6) Build another model using one of the continuous variables from your six most important. This time use your model selection and dimension reduction tools, and include at least one non-linear term. (Mandatory)
+
+Create model evaluation function
+```{r}
+eval_results <- function(true, predicted) {
+  SST <- sum((true - mean(true))^2)
+  SSE <- sum((predicted - true)^2)
+  
+  R_square <- 1 - SSE / SST
+  MSE = SSE/length(true)
+  RMSE = sqrt(MSE)
+  MAE = mean(abs(pred - true))
+
+  # Model performance metrics
+  data.frame(
+    Rsquare = R_square,
+    RMSE = RMSE,
+    MSE = MSE,
+    MAE = MAE
+  )
+}
+```
+
+Feature engineering: convert string to factor
+```{r}
+model_data_df = annual_snow_resort_df
+
+categorical_cols = c("Continent", "Country", "Child.friendly", "Snowparks", "Nightskiing", "Summer.skiing")
+model_data_df[categorical_cols] = lapply(model_data_df[categorical_cols], factor)
+```
+
+##### 6.1) Include a non-linear term
+
+In Q2, we notice the range of Lift.capacity is from 0 to 252280 in our dataset but the price is only from 0 to 140. I will apply a non-linear transformation to Lift.capacity to bring the number down. I will try log and square root and let feature selection technique to find which one is better.
+
+```{r}
+model_data_df$Lift.capacity_log = log(model_data_df$Lift.capacity)
+model_data_df$Lift.capacity_sqrt = sqrt(model_data_df$Lift.capacity)
+```
+
+##### 6.2) Train test split
+
+```{r}
+#make this example reproducible
+set.seed(1)
+
+# train test split
+sample = sample(c(TRUE, FALSE), nrow(model_data_df), replace=TRUE, prob=c(0.8, 0.2))
+train_df = model_data_df[sample, ]
+test_df = model_data_df[!sample, ]
+```
+
+##### 6.3) Stepwise regression to find the most important features
+
+I pass all features to stepwise regression and use AIC as criteria to find the best features
+```{r}
+train_df = train_df[, !names(train_df) %in% c("Season", "Resort", "ID")]
+fit = lm(Price ~ ., data = train_df)
+stepwise_fit_AIC = step(fit, k=2, trace=0)
+summary(stepwise_fit_AIC)
+```
+
+Calculate the R-square of the AIC model
+
+```{r}
+# Best stepwise model using AIC
+AIC_step_model = lm (Price ~ annual_mean_snow + Latitude + Country + 
+    Highest.point + Difficult.slopes + Longest.run + Surface.lifts + 
+    Nightskiing + season_length + June + Lift.capacity_log,
+                 data = train_df)
+
+summary(AIC_step_model)$r.squared
+```
+
+11 features are selected by AIC stepwise regression and the R-squared is 0.8209787. In addition, the model prefers to use log of Lift.capacity over Lift.capacity or square root of Lift.capacity.
+
+Now let's try using BIC as the criteria to reduce the number of features
+```{r}
+stepwise_fit_BIC = step(fit, k=log(nrow(train_df)), trace=0)
+summary(stepwise_fit_BIC)
+```
+
+Calculate the R-square of the BIC model
+```{r}
+# Best stepwise model using BIC
+BIC_step_model = lm (Price ~ annual_mean_snow + Latitude + Country + 
+    Highest.point + Difficult.slopes + Surface.lifts + June + 
+    Lift.capacity_log, 
+                 data = train_df)
+
+summary(BIC_step_model)$r.squared
+```
+
+BIC stepwise regression eliminates 3 features (Longest.run, Nightskiing and season_length). The remaining features are annual mean snow, latitude, country, highest point, number of difficult slopes, number of surface lifts, whether resort is open in June, and log of lift capacity. The R-square decreases from 0.8209787 to 0.8166614, which is acceptable.
+
+```{r}
+summary(BIC_step_model)
+```
+
+
+##### 6.4) Evaluation on test set
+
+Let's exam our model on test dataset.
+```{r}
+test_df_new = test_df[test_df$Country %in% unique(train_df$Country), ]
+pred = predict(BIC_step_model, newdata = test_df_new)
+
+eval_results(test_df_new$Price, pred)
+```
+
+Our model achieves R-square of 0.77 on test set. On average, our price prediction is off by $6.6 from the true price. I would say this is a descent regression model to predict world-wide ski resort price.
+
+\newpage
+#### 7) Discuss briefly the steps you would take to make sure your analysis is reproducible and easy to evaluate by others, even if the data is updated later. (Option)
+
+Skipped.
+
+#### 8) Discuss briefly any ethical concerns like residual disclosure that might arise from the use of your data set, possibly in combination with some additional data outside your dataset. (Option)
+
+There is little ethical concern about this dataset as the information about ski resorts is publicly available and the information expose no harm or risk to any individual or institution.
